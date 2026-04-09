@@ -700,6 +700,25 @@ class FixPredecessorOfConditionalJumpBlock(GenericUnflatteningRule):
                 mod.cond_block_serial, mod.target_serial
             )
 
+        # update_blk_successor() can retarget:
+        # - any edge for 1-way predecessors
+        # - only the conditional edge (tail.d.b) for 2-way predecessors
+        # It cannot retarget a 2-way predecessor's fallthrough edge.
+        if pred_blk.nsucc() == 2:
+            cond_target = (
+                pred_blk.tail.d.b
+                if pred_blk.tail is not None and ida_hexrays.is_mcode_jcond(pred_blk.tail.opcode)
+                else None
+            )
+            if cond_target is None or int(cond_target) != int(mod.cond_block_serial):
+                unflat_logger.warning(
+                    "Skipping predecessor rewrite for pred %d -> cond %d: "
+                    "unsupported 2-way fallthrough/source edge",
+                    mod.pred_serial,
+                    mod.cond_block_serial,
+                )
+                return False
+
         try:
             new_jmp_block = None
             new_jmp_block = self._clone_conditional_block(cond_blk)

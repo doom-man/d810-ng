@@ -211,6 +211,13 @@ class UnflattenerFakeJump(GenericUnflatteningRule):
         self.mba = blk.mba
         if not self.check_if_rule_should_be_used(blk):
             return 0
+        unflat_logger.info(
+            "Starting fake-jump unflattening: func=0x%x maturity=%s pass=%s blk=%s",
+            self.mba.entry_ea,
+            self.cur_maturity,
+            self.cur_maturity_pass,
+            blk.serial,
+        )
         self.last_pass_nb_patch_done = self.analyze_blk(blk)
         if self.last_pass_nb_patch_done > 0:
             self.mba.mark_chains_dirty()
@@ -229,5 +236,15 @@ class UnflattenerFakeJump(GenericUnflatteningRule):
                     "a corrupted MBA"
                 )
                 # Return patch count so IDA knows the MBA was touched
+                unflat_logger.info(
+                    "Finished fake-jump unflattening: func=0x%x total_changes=%d (verify failed)",
+                    self.mba.entry_ea,
+                    self.last_pass_nb_patch_done,
+                )
                 return self.last_pass_nb_patch_done
+        unflat_logger.info(
+            "Finished fake-jump unflattening: func=0x%x total_changes=%d",
+            self.mba.entry_ea,
+            self.last_pass_nb_patch_done,
+        )
         return self.last_pass_nb_patch_done

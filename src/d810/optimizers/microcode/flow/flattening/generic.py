@@ -817,6 +817,12 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
             "MMAT_CALLS guard: defer to later maturities when dispatcher entry has conditional predecessor(s)",
         ),
         ConfigParam(
+            "defer_calls_on_conditional_chain_dispatcher",
+            bool,
+            True,
+            "MMAT_CALLS guard: defer CONDITIONAL_CHAIN dispatcher unflattening to later maturities",
+        ),
+        ConfigParam(
             "log_calls_layout_signals",
             bool,
             True,
@@ -869,6 +875,7 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
     DEFAULT_MAX_CALLS_ENTRY_PREDS = 24
     DEFAULT_MAX_CALLS_EXIT_BLOCKS = 24
     DEFAULT_DEFER_CALLS_ON_CONDITIONAL_ENTRY_FATHER = True
+    DEFAULT_DEFER_CALLS_ON_CONDITIONAL_CHAIN_DISPATCHER = True
     DEFAULT_LOG_CALLS_LAYOUT_SIGNALS = True
     DEFAULT_PRE_UNFLATTEN_OPTIMIZE_LOCAL_ROUNDS = 0
     DEFAULT_PRE_UNFLATTEN_VERIFY = True
@@ -883,6 +890,9 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
         self.max_calls_exit_blocks = self.DEFAULT_MAX_CALLS_EXIT_BLOCKS
         self.defer_calls_on_conditional_entry_father = (
             self.DEFAULT_DEFER_CALLS_ON_CONDITIONAL_ENTRY_FATHER
+        )
+        self.defer_calls_on_conditional_chain_dispatcher = (
+            self.DEFAULT_DEFER_CALLS_ON_CONDITIONAL_CHAIN_DISPATCHER
         )
         self.log_calls_layout_signals = self.DEFAULT_LOG_CALLS_LAYOUT_SIGNALS
         self.min_cfg_edges_required = -1
@@ -942,6 +952,10 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
             self.defer_calls_on_conditional_entry_father = self.config[
                 "defer_calls_on_conditional_entry_father"
             ]
+        if "defer_calls_on_conditional_chain_dispatcher" in self.config.keys():
+            self.defer_calls_on_conditional_chain_dispatcher = self.config[
+                "defer_calls_on_conditional_chain_dispatcher"
+            ]
         if "log_calls_layout_signals" in self.config.keys():
             self.log_calls_layout_signals = self.config["log_calls_layout_signals"]
         if "min_cfg_edges_required" in self.config.keys():
@@ -967,6 +981,7 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
         "max_calls_entry_preds",
         "max_calls_exit_blocks",
         "defer_calls_on_conditional_entry_father",
+        "defer_calls_on_conditional_chain_dispatcher",
         "log_calls_layout_signals",
         "min_cfg_edges_required",
         "pre_unflatten_optimize_local_rounds",
@@ -1207,6 +1222,28 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
                 item["internal_block_count"],
                 item["exit_block_count"],
             )
+
+    def _should_skip_calls_for_conditional_chain(self) -> bool:
+        """Return True when MMAT_CALLS should defer CONDITIONAL_CHAIN unflattening."""
+        if (
+            self.mba is None
+            or self.mba.maturity != ida_hexrays.MMAT_CALLS
+            or not self.defer_calls_on_conditional_chain_dispatcher
+        ):
+            return False
+        try:
+            from d810.optimizers.microcode.flow.flattening.dispatcher_detection import (
+                DispatcherCache,
+                DispatcherType,
+            )
+            analysis = DispatcherCache.get_or_create(self.mba).analyze()
+            return analysis.dispatcher_type == DispatcherType.CONDITIONAL_CHAIN
+        except Exception as exc:
+            # Fail-open: if classifier is unavailable, keep existing behavior.
+            unflat_logger.debug(
+                "MMAT_CALLS conditional-chain guard unavailable: %s", exc
+            )
+            return False
 
     # Maximum blocks for which retrieve_all_dispatchers will attempt
     # full exploration.  Beyond this, the dispatcher search is skipped
@@ -2678,6 +2715,14 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
         if not self.check_if_rule_should_be_used(blk):
             return 0
 
+        unflat_logger.info(
+            "Starting unflattening optimize: func=0x%x maturity=%s pass=%s blk=%s",
+            self.mba.entry_ea,
+            self.cur_maturity,
+            self.cur_maturity_pass,
+            blk.serial,
+        )
+
         self._optimize_deadline = _time.monotonic() + self.MAX_OPTIMIZE_SECONDS
 
         # Apply any modifications scheduled for this maturity level
@@ -2706,12 +2751,23 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
         self.retrieve_all_dispatchers()
         if len(self.dispatcher_list) == 0:
             unflat_logger.info("No dispatcher found at maturity %s", self.mba.maturity)
+            unflat_logger.info(
+                "Finished unflattening optimize: func=0x%x total_changes=%d (no dispatcher)",
+                self.mba.entry_ea,
+                initial_changes,
+            )
             return initial_changes
 
         layout_signals = self._collect_dispatcher_layout_signals()
         self._emit_layout_signals(layout_signals)
 
         if self.mba.maturity == ida_hexrays.MMAT_CALLS:
+            if self._should_skip_calls_for_conditional_chain():
+                unflat_logger.warning(
+                    "Skipping MMAT_CALLS unflattening for CONDITIONAL_CHAIN dispatcher; "
+                    "deferring to later maturities"
+                )
+                return initial_changes
             # Selective MMAT_CALLS guard:
             # We only skip the risky shape (high fan-in + large dispatcher) and
             # preserve MMAT_CALLS behavior for common compact dispatchers.
@@ -2768,6 +2824,11 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
                 unflat_logger.warning(skip_reason)
             else:
                 unflat_logger.warning("Skipping unflattening pass via layout guard")
+            unflat_logger.info(
+                "Finished unflattening optimize: func=0x%x total_changes=%d (pass skipped)",
+                self.mba.entry_ea,
+                initial_changes,
+            )
             return initial_changes
         unflat_logger.info(
             "Unflattening: %s dispatcher(s) found", len(self.dispatcher_list)
@@ -2841,4 +2902,10 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
             "optimizing GenericDispatcherUnflatteningRule.optimize",
             logger_func=unflat_logger.error,
         )
-        return self.last_pass_nb_patch_done + initial_changes
+        total_changes = self.last_pass_nb_patch_done + initial_changes
+        unflat_logger.info(
+            "Finished unflattening optimize: func=0x%x total_changes=%d",
+            self.mba.entry_ea,
+            total_changes,
+        )
+        return total_changes
