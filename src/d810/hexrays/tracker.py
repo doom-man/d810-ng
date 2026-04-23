@@ -11,6 +11,7 @@ from d810.core import getLogger
 from d810.expr.emulator import MicroCodeEnvironment, MicroCodeInterpreter, fetch_idb_value
 from d810.hexrays.cfg_utils import (
     change_1way_block_successor,
+    change_2way_block_fallthrough_successor,
     change_2way_block_conditional_successor,
     duplicate_block,
 )
@@ -989,18 +990,20 @@ def try_to_duplicate_one_block(var_histories: list[MopHistory]) -> tuple[int, in
                 i += 1
                 continue
 
-            # For 2-way conditional predecessors, we can only retarget the
-            # explicit conditional edge (tail.d.b). If block_to_duplicate is the
-            # fallthrough path, redirect is not supported here, so skip BEFORE
-            # creating duplicated blocks to avoid CFG/path inconsistencies.
+            # For 2-way conditional predecessors, the explicit conditional edge
+            # can be redirected directly. If block_to_duplicate is reached via
+            # fallthrough, first normalize that implicit edge into an explicit
+            # helper block (cfg_utils.change_2way_block_fallthrough_successor)
+            # and then redirect the helper.
             if (
                 pred_block.tail is not None
                 and ida_hexrays.is_mcode_jcond(pred_block.tail.opcode)
                 and block_to_duplicate.serial != pred_block.tail.d.b
+                and (pred_block.nextb is None or pred_block.nextb.serial != block_to_duplicate.serial)
             ):
                 logger.warning(
-                    "pred %d is jcond but target %d is fallthrough (not cond target %d), "
-                    "skipping duplication+redirect",
+                    "pred %d is jcond but target %d is neither cond target %d nor "
+                    "fallthrough, skipping duplication+redirect",
                     pred_block.serial,
                     block_to_duplicate.serial,
                     pred_block.tail.d.b,
@@ -1019,6 +1022,7 @@ def try_to_duplicate_one_block(var_histories: list[MopHistory]) -> tuple[int, in
                 )
             )
             redirected = False
+            fallthrough_helper = None
             if (pred_block.tail is None) or (
                 not ida_hexrays.is_mcode_jcond(pred_block.tail.opcode)
             ):
@@ -1032,9 +1036,16 @@ def try_to_duplicate_one_block(var_histories: list[MopHistory]) -> tuple[int, in
                     ):
                         nb_change += 1
                         redirected = True
+                elif pred_block.nextb is not None and pred_block.nextb.serial == block_to_duplicate.serial:
+                    fallthrough_helper = change_2way_block_fallthrough_successor(
+                        pred_block, duplicated_blk_jmp.serial, verify=False
+                    )
+                    if fallthrough_helper is not None:
+                        nb_change += 1
+                        redirected = True
                 else:
                     logger.warning(
-                        "pred %d is jcond but target %d is fallthrough (not cond target %d), "
+                        "pred %d is jcond but target %d is neither fallthrough nor cond target %d, "
                         "skipping redirect",
                         pred_block.serial, block_to_duplicate.serial, pred_block.tail.d.b,
                     )
@@ -1056,6 +1067,14 @@ def try_to_duplicate_one_block(var_histories: list[MopHistory]) -> tuple[int, in
                 var_history.replace_block_in_path(
                     block_to_duplicate, duplicated_blk_jmp
                 )
+                if fallthrough_helper is not None:
+                    duplicated_index = get_blk_index(
+                        duplicated_blk_jmp, var_history.block_path
+                    )
+                    if duplicated_index >= 0:
+                        var_history.insert_block_in_path(
+                            fallthrough_helper, duplicated_index
+                        )
                 if block_to_duplicate.tail is not None and ida_hexrays.is_mcode_jcond(
                     block_to_duplicate.tail.opcode
                 ):
@@ -1117,6 +1136,21 @@ def duplicate_histories(
         cur_pass += 1
     for i, var_history in enumerate(var_histories):
         logger.info(" end.{0}: {1}".format(i, var_history.block_serial_path))
+    # After block duplication/redirect, SSA use-def chains are stale.
+    # mark_chains_dirty() tells Hex-Rays to recompute them before its own
+    # GLBOPT passes run; without this, IDA sees inconsistent internal state
+    # and raises INTERR 51832 ("macro-instruction type mismatch").
+    if total_nb_duplication > 0 or total_nb_change > 0:
+        try:
+            mba = var_histories[0].block_path[0].mba
+            mba.mark_chains_dirty()
+            logger.info(
+                "duplicate_histories: marked chains dirty after %d duplications, "
+                "%d redirects (%d passes)",
+                total_nb_duplication, total_nb_change, cur_pass,
+            )
+        except Exception as e:
+            logger.warning("duplicate_histories: failed to mark_chains_dirty: %s", e)
     return total_nb_duplication, total_nb_change
 
 

@@ -35,6 +35,7 @@ from d810.hexrays.cfg_utils import (
     change_1way_block_successor,
     duplicate_block,
     make_2way_block_goto,
+    mba_maturity_unflatten_global_opt_early,
     safe_verify,
     update_blk_successor,
 )
@@ -1335,7 +1336,13 @@ class HodurUnflattener(GenericUnflatteningRule):
 
         if nb_fixed > 0:
             self.mba.mark_chains_dirty()
-            self.mba.optimize_local(0)
+            if not mba_maturity_unflatten_global_opt_early(self.mba):
+                self.mba.optimize_local(0)
+            else:
+                unflat_logger.info(
+                    "UnflattenerHodur: skipping optimize_local(0) at MMAT_GLBOPT1..3 "
+                    "(avoids INTERR 50860/51832)"
+                )
 
         return nb_fixed
 
