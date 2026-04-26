@@ -939,24 +939,14 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
             return False
         if not super().check_if_rule_should_be_used(blk):
             return False
+        # NOTE: We previously added an extra GLBOPT1..3 single-pass cap here,
+        # but that misunderstood ``cur_maturity_pass``: it's the count of
+        # optimizer *callbacks* from IDA (one per block), not the number of
+        # unflatten passes over the whole function.  The existing guard on the
+        # next line (skip when the previous callback made no changes) already
+        # bounds work correctly, and _verify_failed above stops everything
+        # after remove_flattening() aborts a broken pass.
         if (self.cur_maturity_pass >= 1) and (self.last_pass_nb_patch_done == 0):
-            return False
-        # At MMAT_GLBOPT1..3, limit to a single pass per maturity. Successive
-        # passes on an already-modified CFG accumulate inconsistencies that
-        # IDA's C++ GLBOPT optimizer will reject with INTERR 51832 once the
-        # MBA is returned to it — an error the Python layer cannot catch.
-        # A single pass per maturity still provides substantial deobfuscation
-        # while keeping the MBA acceptable to Hex-Rays.
-        if (
-            self.cur_maturity_pass >= 1
-            and mba_maturity_unflatten_global_opt_early(self.mba)
-        ):
-            unflat_logger.info(
-                "Skipping pass %d at %s: single-pass cap at MMAT_GLBOPT1..3 "
-                "(avoids INTERR 51832 from successive CFG rewrites)",
-                self.cur_maturity_pass,
-                self.cur_maturity,
-            )
             return False
         if (self.max_passes is not None) and (
             self.cur_maturity_pass >= self.max_passes
@@ -1358,7 +1348,14 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
     # Maximum number of histories allowed per dispatcher father before
     # we skip duplication.  Beyond this threshold duplicate_histories()
     # becomes prohibitively expensive (exponential block creation).
-    MAX_HISTORIES_PER_FATHER = 100
+    #
+    # Empirically, multi-variable state machines (e.g. 0x401130 in
+    # hello_full_obf.i64) produce ~8 histories per state-bridge father,
+    # each expanding into ~12 new blocks -> ~93 blocks per father.  A
+    # threshold of 4 keeps the total expansion under the decompiler budget
+    # (~3x baseline) for small functions while still letting clean 1-2
+    # history fathers through.
+    MAX_HISTORIES_PER_FATHER = 4
 
     def _is_past_deadline(self) -> bool:
         """Check if the current optimize() call has exceeded its time budget."""
@@ -1422,6 +1419,50 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
             dispatcher_father.serial,
             father_histories_cst,
         )
+
+        # Pre-flight emulation check:
+        #
+        # duplicate_histories() is expensive — it physically rewires the CFG
+        # and can add dozens of blocks.  If the subsequent
+        # resolve_dispatcher_father() run will fail on those new blocks
+        # anyway (e.g. because the function uses a multi-variable state
+        # machine where some fathers need to emulate register-bridged state
+        # copies the tracker cannot follow), the duplication is pure waste:
+        # we end up with a half-expanded CFG that IDA's own decompiler can't
+        # finish.
+        #
+        # Guard against that by running each history through the dispatcher
+        # emulator *before* any CFG write.  If any history lands on an
+        # internal dispatcher block (i.e. emulation bailed mid-way) we skip
+        # this father and let the pass continue with the fathers we can
+        # actually resolve.
+        try:
+            exit_serials = {
+                eb.serial for eb in dispatcher_info.dispatcher_exit_blocks
+            }
+            for fh in father_histories:
+                probe_blk, _ = dispatcher_info.emulate_dispatcher_with_father_history(
+                    fh, resolve_conditional_exits=True,
+                )
+                if probe_blk is None or probe_blk.serial not in exit_serials:
+                    raise NotDuplicableFatherException(
+                        "Dispatcher {0} predecessor {1}: pre-flight emulation "
+                        "landed on non-exit block {2}; refusing to duplicate "
+                        "(register-bridged state or untracked variable)".format(
+                            dispatcher_entry_block.serial,
+                            dispatcher_father.serial,
+                            probe_blk.serial if probe_blk is not None else None,
+                        )
+                    )
+        except NotResolvableFatherException as e:
+            # emulator itself raised — treat as not duplicable.
+            raise NotDuplicableFatherException(
+                "Dispatcher {0} predecessor {1}: pre-flight emulation raised: "
+                "{2}".format(
+                    dispatcher_entry_block.serial, dispatcher_father.serial, e,
+                )
+            ) from e
+
         nb_duplication, nb_change = duplicate_histories(
             father_histories, max_nb_pass=self.max_duplication_passes
         )
@@ -2583,7 +2624,11 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
 
     # Maximum cumulative blocks that may be created by duplicate_histories()
     # across all dispatcher fathers in a single remove_flattening() pass.
-    MAX_CUMULATIVE_DUPLICATIONS = 500
+    # Lowered from 500 to 100 so multi-variable state machines cannot
+    # balloon the CFG past IDA's decompiler tolerance before the
+    # decompile-budget guard at the top of remove_flattening() kicks in on
+    # the next pass.
+    MAX_CUMULATIVE_DUPLICATIONS = 100
 
     def remove_flattening(self) -> int:
         # MMAT_GLBOPT2/GLBOPT3 guard: generic dispatcher unflattening at these
@@ -2609,6 +2654,41 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
                 self.cur_maturity,
                 int(self.mba.entry_ea),
             )
+            return 0
+
+        # Decompiler-budget guard: IDA's Hex-Rays pseudocode builder refuses
+        # MBAs whose block count has ballooned too far beyond the original
+        # function, returning INTERR 51832 from ``decompile()`` even though
+        # our CFG rewrites succeeded in isolation.  Record the very first
+        # block count we ever see for this function (typically at
+        # MMAT_CALLS) and compare every subsequent pass against it -- if
+        # duplication has pushed us beyond a hard threshold, stop now and
+        # mark the rule disabled so Hex-Rays can attempt decompilation with
+        # whatever we have already resolved.
+        _budget_baseline = getattr(self, "_decompile_budget_baseline_qty", None)
+        current_qty = int(self.mba.qty)
+        if _budget_baseline is None:
+            self._decompile_budget_baseline_qty = current_qty
+            _budget_baseline = current_qty
+        _DECOMPILE_BUDGET_RATIO = 3   # accept up to 3x the original function size
+        _DECOMPILE_BUDGET_FLOOR = 80  # and never below an absolute floor
+        _budget_ceiling = max(
+            _budget_baseline * _DECOMPILE_BUDGET_RATIO, _DECOMPILE_BUDGET_FLOOR
+        )
+        if current_qty >= _budget_ceiling:
+            unflat_logger.warning(
+                "remove_flattening: skipping further unflatten at %s for "
+                "func=0x%x -- block count %d has hit %dx baseline %d (ceiling "
+                "%d); additional rewrites would trigger INTERR 51832 from "
+                "IDA's decompiler",
+                self.cur_maturity,
+                int(self.mba.entry_ea),
+                current_qty,
+                _DECOMPILE_BUDGET_RATIO,
+                _budget_baseline,
+                _budget_ceiling,
+            )
+            self._verify_failed = True
             return 0
 
         # NOTE: Historically this guard deferred aggressive unflatten from

@@ -1355,9 +1355,17 @@ def ensure_last_block_is_goto(mba: ida_hexrays.mbl_array_t, verify: bool = True)
     elif last_blk.nsucc() == 0:
         return 0
     else:
-        raise ControlFlowException(
-            "Last block {0} is not one way (not supported yet)".format(last_blk.serial)
+        # After a first unflatten pass, the block second-from-last may be a
+        # 2-way conditional (e.g. the dispatcher fallback).  That is a legal
+        # CFG shape; simply skip the goto-promotion pre-step instead of
+        # aborting the entire optimizer pass with an exception.
+        helper_logger.info(
+            "ensure_last_block_is_goto: skipping — block %d has nsucc=%d "
+            "(not 0/1-way); leaving CFG unchanged",
+            last_blk.serial,
+            last_blk.nsucc(),
         )
+        return 0
 
 
 def duplicate_block(block_to_duplicate: ida_hexrays.mblock_t, verify: bool = True) -> tuple[ida_hexrays.mblock_t, ida_hexrays.mblock_t | None]:

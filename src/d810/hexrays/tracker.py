@@ -167,6 +167,12 @@ class MopHistory(object):
         self._mc_initial_environment = MicroCodeEnvironment()
         self._mc_current_environment = self._mc_initial_environment.get_copy()
         self._is_dirty = True
+        # Set to True if _execute_microcode had to fall back to symbolic mode
+        # (i.e. the concrete run hit an undefined operand and we re-ran the
+        # history with synthetic sentinels filling in the gaps).  Results read
+        # from the environment after a fallback must be screened for sentinel
+        # values -- see ``_is_synthetic_value``.
+        self._mc_symbolic_fallback = False
 
         # Cached serial path for O(1) lookup - invalidated on history changes
         self._serial_cache: tuple[int, ...] | None = None
@@ -192,6 +198,7 @@ class MopHistory(object):
         new_mop_history._mc_current_environment = (
             new_mop_history._mc_initial_environment.get_copy()
         )
+        new_mop_history._mc_symbolic_fallback = self._mc_symbolic_fallback
         # Copy the serial cache if valid (same history structure)
         new_mop_history._serial_cache = self._serial_cache
         new_mop_history._serial_set_cache = self._serial_set_cache
@@ -287,7 +294,35 @@ class MopHistory(object):
                 len(self.history),
                 sum(len(blk_info.ins_list) for blk_info in self.history),
             )
+        # Start a fresh execution -- clear any prior symbolic-fallback flag.
+        self._mc_symbolic_fallback = False
         self._mc_current_environment = self._mc_initial_environment.get_copy()
+
+        # Two-pass execution:
+        #
+        # 1. Concrete pass with fail-fast: if every instruction emulates
+        #    cleanly, we have a fully-resolved constant value for every
+        #    searched mop -- the fastest and most precise outcome.
+        #
+        # 2. Symbolic fallback: when the concrete pass hits an undefined
+        #    variable (e.g. a primary state variable used through a
+        #    register bridge whose upstream definition is outside the
+        #    tracked history), silently re-emulate in symbolic mode.  The
+        #    symbolic run populates the environment with synthetic
+        #    sentinels (tagged with 0xD810000000000000) for undefined
+        #    inputs, letting us still emulate the remaining real
+        #    instructions.  ``get_mop_constant_value`` later checks whether
+        #    the *searched* mop landed on a real constant or a sentinel.
+        #
+        # The fallback is critical for multi-variable state machines where
+        # the dispatcher comparison variable is kept in sync with a
+        # separate primary variable through register copies.  Without it
+        # the tracker returns "unresolved" for fathers that are in fact
+        # perfectly resolvable in aggregate, which causes
+        # ``duplicate_histories`` to expand the CFG and then
+        # ``resolve_dispatcher_father`` to abandon every new father,
+        # leaving the MBA in a corrupt half-expanded state that IDA
+        # refuses to decompile.
         for blk_info in self.history:
             for blk_ins in blk_info.ins_list:
                 if logger.debug_on:
@@ -297,8 +332,10 @@ class MopHistory(object):
                 if not self._mc_interpreter.eval_instruction(
                     blk_info.blk, blk_ins, self._mc_current_environment
                 ):
-                    self._is_dirty = False
-                    return False
+                    # Concrete pass failed -- retry this history with a
+                    # fresh symbolic interpreter so undefined operands get
+                    # synthetic values and later instructions still execute.
+                    return self._execute_microcode_symbolic()
         self._is_dirty = False
         # Debug: dump environment after execution
         if logger.debug_on:
@@ -306,6 +343,63 @@ class MopHistory(object):
                 "Tracker environment after _execute_microcode"
             )
         return True
+
+    def _execute_microcode_symbolic(self) -> bool:
+        """Retry execution with symbolic_mode=True after a concrete failure.
+
+        Returns True if the symbolic run completed without raising; False on
+        hard errors (malformed instruction etc).  ``get_mop_constant_value``
+        is responsible for distinguishing real constants from the synthetic
+        sentinels this mode introduces.
+        """
+        # Lazy import to avoid a circular module load at tracker import time.
+        from d810.expr.emulator import MicroCodeInterpreter, MicroCodeEnvironment
+
+        symbolic_interp = MicroCodeInterpreter(symbolic_mode=True)
+        symbolic_env = MicroCodeEnvironment()
+        # Seed the symbolic environment with the known initial values so
+        # dispatcher-state variables still carry their concrete inputs.
+        for mop, value in list(self._mc_initial_environment.mop_r_record.items()):
+            symbolic_env.define(mop, value)
+        for mop, value in list(self._mc_initial_environment.mop_S_record.items()):
+            symbolic_env.define(mop, value)
+
+        for blk_info in self.history:
+            for blk_ins in blk_info.ins_list:
+                if not symbolic_interp.eval_instruction(
+                    blk_info.blk, blk_ins, symbolic_env
+                ):
+                    # Even symbolic mode gave up -- treat as unresolved.
+                    self._is_dirty = False
+                    return False
+        # Install the symbolic environment as our current one so
+        # ``get_mop_constant_value`` can read from it, but remember that
+        # it contains synthetic sentinels.
+        self._mc_current_environment = symbolic_env
+        self._mc_symbolic_fallback = True
+        self._is_dirty = False
+        if logger.debug_on:
+            logger.debug(
+                "_execute_microcode: fell back to symbolic mode for path %s",
+                self.block_serial_path,
+            )
+        return True
+
+    # Synthetic-value tag emitted by ``SyntheticCallReturnCache``.  Any value
+    # whose high bits match this mask was fabricated by the symbolic emulator
+    # to stand in for an undefined operand -- it is NOT a real program value
+    # and MUST NOT be presented to the caller as a resolved constant.
+    _SYNTHETIC_SENTINEL_MASK = 0xD810000000000000
+    _SYNTHETIC_SENTINEL_TOP = 0xFFF0000000000000
+
+    def _is_synthetic_value(self, value: int) -> bool:
+        if value is None:
+            return False
+        try:
+            v = int(value) & 0xFFFFFFFFFFFFFFFF
+        except Exception:
+            return False
+        return (v & self._SYNTHETIC_SENTINEL_TOP) == self._SYNTHETIC_SENTINEL_MASK
 
     def get_mop_constant_value(self, searched_mop: ida_hexrays.mop_t) -> Union[None, int]:
         if logger.debug_on:
@@ -321,7 +415,21 @@ class MopHistory(object):
             self._mc_current_environment.dump(
                 f"Tracker environment before eval_mop for {format_mop_t(searched_mop)}"
             )
-        return self._mc_interpreter.eval_mop(searched_mop, self._mc_current_environment)
+        value = self._mc_interpreter.eval_mop(
+            searched_mop, self._mc_current_environment
+        )
+        # If symbolic fallback produced a synthetic sentinel, the searched
+        # mop is not actually resolvable -- report None so callers (e.g.
+        # ``check_if_all_values_are_found``) correctly classify this history
+        # as unresolved.
+        if getattr(self, "_mc_symbolic_fallback", False) and self._is_synthetic_value(value):
+            if logger.debug_on:
+                logger.debug(
+                    "get_mop_constant_value: symbolic sentinel for %s -> None",
+                    format_mop_t(searched_mop),
+                )
+            return None
+        return value
 
     def print_info(self, detailed_info=False):
         formatted_mop_searched_list = [format_mop_t(x) for x in self.searched_mop_list]
